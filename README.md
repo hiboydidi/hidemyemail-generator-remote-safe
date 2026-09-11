@@ -179,6 +179,10 @@ to the configured IMAP host and port. HTML mail is converted to local plain text
 so remote images, tracking pixels, fonts, stylesheets, and similar sender-hosted
 resources are not requested by the inbox parser.
 
+On macOS, if a system SOCKS proxy is enabled, inbox sync automatically routes the
+IMAP connection through that proxy while keeping the same remote-content block.
+This is useful on networks where direct IMAP TCP connections are unavailable.
+
 If Apple rate-limits creation, the app preserves completed addresses, shows a
 countdown, and retries after at least 30 minutes while the app remains open.
 Use **Import Cookie File…** only if embedded sign-in does not provide the

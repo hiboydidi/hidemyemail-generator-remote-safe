@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import sqlite3
+import subprocess
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
+
+import socks
 
 
 DEFAULT_DB_FILE = "hidemyemail.db"
@@ -62,9 +65,38 @@ def _normalize_network_port(value: object) -> int:
         return socket.getservbyname(str(value), "tcp")
 
 
+def get_system_socks_proxy(proxy_text: Optional[str] = None) -> Optional[tuple[str, int]]:
+    """Return the enabled macOS system SOCKS proxy, if one is configured."""
+    if proxy_text is None:
+        try:
+            result = subprocess.run(
+                ["/usr/sbin/scutil", "--proxy"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        proxy_text = result.stdout
+
+    enabled = re.search(r"(?m)^\s*SOCKSEnable\s*:\s*(\d+)\s*$", proxy_text)
+    host = re.search(r"(?m)^\s*SOCKSProxy\s*:\s*(\S+)\s*$", proxy_text)
+    port = re.search(r"(?m)^\s*SOCKSPort\s*:\s*(\d+)\s*$", proxy_text)
+    if not enabled or enabled.group(1) != "1" or not host or not port:
+        return None
+    return host.group(1), int(port.group(1))
+
+
 @contextmanager
-def imap_only_network(host: str, port: int) -> Iterator[None]:
-    """Allow new TCP connections only to the configured IMAP endpoint."""
+def imap_only_network(
+    host: str,
+    port: int,
+    proxy: Optional[tuple[str, int]] = None,
+) -> Iterator[None]:
+    """Allow new TCP connections only to IMAP or its configured SOCKS endpoint."""
     allowed_host = _normalize_network_host(host)
     allowed_port = _normalize_network_port(port)
 
@@ -80,11 +112,17 @@ def imap_only_network(host: str, port: int) -> Iterator[None]:
         for _, _, _, _, sockaddr in resolved
         if isinstance(sockaddr, tuple) and sockaddr
     )
+    proxy_host = proxy_port = None
+    if proxy is not None:
+        proxy_host = _normalize_network_host(proxy[0])
+        proxy_port = _normalize_network_port(proxy[1])
 
     def require_allowed(target_host: object, target_port: object) -> None:
         normalized_host = _normalize_network_host(target_host)
         normalized_port = _normalize_network_port(target_port)
         if normalized_host in allowed_hosts and normalized_port == allowed_port:
+            return
+        if proxy_host is not None and normalized_host == proxy_host and normalized_port == proxy_port:
             return
         raise PermissionError(
             errno.EACCES,
@@ -128,6 +166,41 @@ def imap_only_network(host: str, port: int) -> Iterator[None]:
         socket.create_connection = original_create_connection
         socket.socket.connect = original_connect
         socket.socket.connect_ex = original_connect_ex
+
+
+class _SOCKSIMAP4(imaplib.IMAP4):
+    def __init__(self, host: str, port: int, proxy: tuple[str, int]):
+        self._socks_proxy = proxy
+        super().__init__(host, port)
+
+    def _create_socket(self, timeout):
+        proxy_host, proxy_port = self._socks_proxy
+        return socks.create_connection(
+            (self.host, self.port),
+            timeout=timeout,
+            proxy_type=socks.SOCKS5,
+            proxy_addr=proxy_host,
+            proxy_port=proxy_port,
+            proxy_rdns=True,
+        )
+
+
+class _SOCKSIMAP4SSL(imaplib.IMAP4_SSL):
+    def __init__(self, host: str, port: int, proxy: tuple[str, int]):
+        self._socks_proxy = proxy
+        super().__init__(host, port)
+
+    def _create_socket(self, timeout):
+        proxy_host, proxy_port = self._socks_proxy
+        sock = socks.create_connection(
+            (self.host, self.port),
+            timeout=timeout,
+            proxy_type=socks.SOCKS5,
+            proxy_addr=proxy_host,
+            proxy_port=proxy_port,
+            proxy_rdns=True,
+        )
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
 
 
 def utc_now() -> str:
@@ -681,14 +754,27 @@ def sync_inbox(
 ) -> list[dict]:
     conn = connect_db(db_file)
     mailbox = None
+    host = config.host.strip()
+    username = config.username.strip()
+    password = config.password.strip()
+    if host.lower() in {"imap.gmail.com", "imap.googlemail.com"}:
+        password = re.sub(r"\s+", "", password)
+    proxy = get_system_socks_proxy()
     try:
-        with imap_only_network(config.host, config.port):
-            mailbox = (
-                imaplib.IMAP4_SSL(config.host, config.port)
-                if config.use_ssl
-                else imaplib.IMAP4(config.host, config.port)
-            )
-            mailbox.login(config.username, config.password)
+        with imap_only_network(host, config.port, proxy=proxy):
+            if proxy is not None:
+                mailbox = (
+                    _SOCKSIMAP4SSL(host, config.port, proxy)
+                    if config.use_ssl
+                    else _SOCKSIMAP4(host, config.port, proxy)
+                )
+            else:
+                mailbox = (
+                    imaplib.IMAP4_SSL(host, config.port)
+                    if config.use_ssl
+                    else imaplib.IMAP4(host, config.port)
+                )
+            mailbox.login(username, password)
             status, _ = mailbox.select(config.folder)
             if status != "OK":
                 raise RuntimeError(f"Could not select IMAP folder: {config.folder}")

@@ -14,6 +14,7 @@ from hidemyemail_generator.inbox import (
     extract_verification_code,
     get_batch,
     get_message_body,
+    get_system_socks_proxy,
     imap_only_network,
     insert_message,
     list_addresses,
@@ -49,6 +50,28 @@ class _TrackingPixelHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass
+
+
+class SystemProxyTests(unittest.TestCase):
+    def test_parses_enabled_macos_socks_proxy(self):
+        sample = """
+        <dictionary> {
+          SOCKSEnable : 1
+          SOCKSPort : 7897
+          SOCKSProxy : 127.0.0.1
+        }
+        """
+        self.assertEqual(get_system_socks_proxy(sample), ("127.0.0.1", 7897))
+
+    def test_ignores_disabled_macos_socks_proxy(self):
+        sample = """
+        <dictionary> {
+          SOCKSEnable : 0
+          SOCKSPort : 7897
+          SOCKSProxy : 127.0.0.1
+        }
+        """
+        self.assertIsNone(get_system_socks_proxy(sample))
 
 
 class RemoteContentProtectionTests(unittest.TestCase):
@@ -91,6 +114,19 @@ class RemoteContentProtectionTests(unittest.TestCase):
             connection.close()
 
         self.assertTrue(accepted.wait(1))
+
+    def test_local_socks_endpoint_can_be_allowed_without_allowing_other_ports(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        proxy_port = listener.getsockname()[1]
+
+        with imap_only_network("imap.gmail.com", 993, proxy=("127.0.0.1", proxy_port)):
+            connection = socket.create_connection(("127.0.0.1", proxy_port), timeout=0.5)
+            connection.close()
+            with self.assertRaises(OSError):
+                socket.create_connection(("127.0.0.1", proxy_port + 1), timeout=0.1)
 
     def test_html_tracking_tag_is_never_returned_as_renderable_content(self):
         from email.message import EmailMessage
