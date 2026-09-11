@@ -1,10 +1,13 @@
 import csv
+import errno
 import html
 import imaplib
 import json
 import re
+import socket
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email import policy
@@ -12,7 +15,7 @@ from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 
 DEFAULT_DB_FILE = "hidemyemail.db"
@@ -46,6 +49,85 @@ class InboxConfig:
     @property
     def account_key(self) -> str:
         return f"{self.username}@{self.host}/{self.folder}"
+
+
+def _normalize_network_host(value: object) -> str:
+    return str(value).strip().strip("[]").rstrip(".").lower()
+
+
+def _normalize_network_port(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return socket.getservbyname(str(value), "tcp")
+
+
+@contextmanager
+def imap_only_network(host: str, port: int) -> Iterator[None]:
+    """Allow new TCP connections only to the configured IMAP endpoint."""
+    allowed_host = _normalize_network_host(host)
+    allowed_port = _normalize_network_port(port)
+
+    original_getaddrinfo = socket.getaddrinfo
+    original_create_connection = socket.create_connection
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+
+    resolved = original_getaddrinfo(host, allowed_port, type=socket.SOCK_STREAM)
+    allowed_hosts = {allowed_host}
+    allowed_hosts.update(
+        _normalize_network_host(sockaddr[0])
+        for _, _, _, _, sockaddr in resolved
+        if isinstance(sockaddr, tuple) and sockaddr
+    )
+
+    def require_allowed(target_host: object, target_port: object) -> None:
+        normalized_host = _normalize_network_host(target_host)
+        normalized_port = _normalize_network_port(target_port)
+        if normalized_host in allowed_hosts and normalized_port == allowed_port:
+            return
+        raise PermissionError(
+            errno.EACCES,
+            "Remote content blocked: outbound connection "
+            f"to {normalized_host}:{normalized_port} is not the configured IMAP endpoint",
+        )
+
+    def guarded_getaddrinfo(query_host, query_port, *args, **kwargs):
+        require_allowed(query_host, query_port)
+        return original_getaddrinfo(query_host, query_port, *args, **kwargs)
+
+    def guarded_create_connection(address, *args, **kwargs):
+        if not isinstance(address, tuple) or len(address) < 2:
+            raise PermissionError(errno.EACCES, "Remote content blocked")
+        require_allowed(address[0], address[1])
+        return original_create_connection(address, *args, **kwargs)
+
+    def guarded_connect(sock, address):
+        if not isinstance(address, tuple) or len(address) < 2:
+            raise PermissionError(errno.EACCES, "Remote content blocked")
+        require_allowed(address[0], address[1])
+        return original_connect(sock, address)
+
+    def guarded_connect_ex(sock, address):
+        try:
+            if not isinstance(address, tuple) or len(address) < 2:
+                raise PermissionError(errno.EACCES, "Remote content blocked")
+            require_allowed(address[0], address[1])
+        except OSError as exc:
+            return exc.errno or errno.EACCES
+        return original_connect_ex(sock, address)
+
+    socket.getaddrinfo = guarded_getaddrinfo
+    socket.create_connection = guarded_create_connection
+    socket.socket.connect = guarded_connect
+    socket.socket.connect_ex = guarded_connect_ex
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+        socket.create_connection = original_create_connection
+        socket.socket.connect = original_connect
+        socket.socket.connect_ex = original_connect_ex
 
 
 def utc_now() -> str:
@@ -598,58 +680,66 @@ def sync_inbox(
     config: InboxConfig, db_file: str = DEFAULT_DB_FILE, limit: int = 50
 ) -> list[dict]:
     conn = connect_db(db_file)
-    mailbox = (
-        imaplib.IMAP4_SSL(config.host, config.port)
-        if config.use_ssl
-        else imaplib.IMAP4(config.host, config.port)
-    )
+    mailbox = None
     try:
-        mailbox.login(config.username, config.password)
-        status, _ = mailbox.select(config.folder)
-        if status != "OK":
-            raise RuntimeError(f"Could not select IMAP folder: {config.folder}")
+        with imap_only_network(config.host, config.port):
+            mailbox = (
+                imaplib.IMAP4_SSL(config.host, config.port)
+                if config.use_ssl
+                else imaplib.IMAP4(config.host, config.port)
+            )
+            mailbox.login(config.username, config.password)
+            status, _ = mailbox.select(config.folder)
+            if status != "OK":
+                raise RuntimeError(f"Could not select IMAP folder: {config.folder}")
 
-        status, data = mailbox.uid("search", None, "ALL")
-        if status != "OK":
-            raise RuntimeError("IMAP search failed")
+            status, data = mailbox.uid("search", None, "ALL")
+            if status != "OK":
+                raise RuntimeError("IMAP search failed")
 
-        uids = data[0].split()
-        if limit > 0:
-            uids = uids[-limit:]
+            uids = data[0].split()
+            if limit > 0:
+                uids = uids[-limit:]
 
-        inserted: list[dict] = []
-        for raw_uid in uids:
-            uid = raw_uid.decode("ascii", errors="ignore")
-            exists = conn.execute(
-                """
-                SELECT 1 FROM messages
-                WHERE account_key = ? AND folder = ? AND uid = ?
-                """,
-                (config.account_key, config.folder, uid),
-            ).fetchone()
-            if exists:
-                continue
+            inserted: list[dict] = []
+            for raw_uid in uids:
+                uid = raw_uid.decode("ascii", errors="ignore")
+                exists = conn.execute(
+                    """
+                    SELECT 1 FROM messages
+                    WHERE account_key = ? AND folder = ? AND uid = ?
+                    """,
+                    (config.account_key, config.folder, uid),
+                ).fetchone()
+                if exists:
+                    continue
 
-            status, msg_data = mailbox.uid("fetch", raw_uid, "(RFC822)")
-            if status != "OK" or not msg_data:
-                continue
+                status, msg_data = mailbox.uid("fetch", raw_uid, "(RFC822)")
+                if status != "OK" or not msg_data:
+                    continue
 
-            raw_message = b""
-            for part in msg_data:
-                if isinstance(part, tuple):
-                    raw_message += part[1]
-            if not raw_message:
-                continue
+                raw_message = b""
+                for part in msg_data:
+                    if isinstance(part, tuple):
+                        raw_message += part[1]
+                if not raw_message:
+                    continue
 
-            record = message_to_record(conn, config, uid, raw_message)
-            if insert_message(conn, record):
-                inserted.append(record)
-        return inserted
+                record = message_to_record(conn, config, uid, raw_message)
+                if insert_message(conn, record):
+                    inserted.append(record)
+
+            try:
+                mailbox.logout()
+            finally:
+                mailbox = None
+            return inserted
     finally:
-        try:
-            mailbox.logout()
-        except Exception:
-            pass
+        if mailbox is not None:
+            try:
+                mailbox.logout()
+            except Exception:
+                pass
         conn.close()
 
 

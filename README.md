@@ -173,6 +173,12 @@ keeps only non-secret inbox settings in app preferences. It creates an
 owner-only temporary CLI config for each inbox sync and deletes it immediately.
 This is intentionally separate from the CLI's `inbox_config.json` workflow.
 
+Inbox sync also enables **remote content protection** by default. While a
+message is being fetched and parsed, new outbound TCP connections are restricted
+to the configured IMAP host and port. HTML mail is converted to local plain text,
+so remote images, tracking pixels, fonts, stylesheets, and similar sender-hosted
+resources are not requested by the inbox parser.
+
 If Apple rate-limits creation, the app preserves completed addresses, shows a
 countdown, and retries after at least 30 minutes while the app remains open.
 Use **Import Cookie File…** only if embedded sign-in does not provide the

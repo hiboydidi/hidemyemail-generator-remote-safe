@@ -1,7 +1,11 @@
+import socket
 import sqlite3
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.request import urlopen
 
 from hidemyemail_generator.inbox import (
     connect_db,
@@ -9,6 +13,8 @@ from hidemyemail_generator.inbox import (
     create_batch,
     extract_verification_code,
     get_batch,
+    get_message_body,
+    imap_only_network,
     insert_message,
     list_addresses,
     list_batches,
@@ -31,6 +37,75 @@ CREATE TABLE messages (
   UNIQUE(account_key, folder, uid));
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+
+
+class _TrackingPixelHandler(BaseHTTPRequestHandler):
+    hits = 0
+
+    def do_GET(self):
+        type(self).hits += 1
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+class RemoteContentProtectionTests(unittest.TestCase):
+    def test_tracking_pixel_is_blocked_before_the_server_sees_a_request(self):
+        _TrackingPixelHandler.hits = 0
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _TrackingPixelHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        pixel_port = server.server_address[1]
+        allowed_imap_port = 993 if pixel_port != 993 else 994
+        pixel_url = f"http://127.0.0.1:{pixel_port}/pixel/unique.gif"
+
+        with imap_only_network("127.0.0.1", allowed_imap_port):
+            with self.assertRaises(OSError):
+                urlopen(pixel_url, timeout=0.5)
+
+        self.assertEqual(_TrackingPixelHandler.hits, 0)
+
+    def test_configured_imap_endpoint_is_still_reachable(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
+        accepted = threading.Event()
+
+        def accept_once():
+            connection, _ = listener.accept()
+            connection.close()
+            accepted.set()
+
+        thread = threading.Thread(target=accept_once, daemon=True)
+        thread.start()
+
+        with imap_only_network("127.0.0.1", port):
+            connection = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+            connection.close()
+
+        self.assertTrue(accepted.wait(1))
+
+    def test_html_tracking_tag_is_never_returned_as_renderable_content(self):
+        from email.message import EmailMessage
+
+        message = EmailMessage()
+        message.set_content(
+            '<p>Your code is 123456</p><img src="https://tracker.example/pixel.gif" width="1" height="1">',
+            subtype="html",
+        )
+
+        body = get_message_body(message)
+
+        self.assertIn("Your code is 123456", body)
+        self.assertNotIn("tracker.example", body)
+        self.assertNotIn("<img", body)
 
 
 class VerificationCodeExtractionTests(unittest.TestCase):
